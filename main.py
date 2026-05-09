@@ -8,6 +8,7 @@ import threading
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from typing import Any, Literal
+from uuid import uuid4
 from urllib.parse import urlparse
 
 import httpx
@@ -31,6 +32,7 @@ _config: dict[str, int] = {
 
 _proxies: dict[str, dict[str, Any]] = {}
 _alerts: list[dict[str, Any]] = []
+_ALERT_THRESHOLD = 0.2
 
 
 def _request_heartbeat_wake() -> None:
@@ -42,6 +44,50 @@ def _request_heartbeat_wake() -> None:
 
 def _utc_now_iso() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
+
+
+def _new_alert_id() -> str:
+    return f"alert-{uuid4().hex[:6]}"
+
+
+def _sync_alerts_locked() -> None:
+    """Maintain one-active-alert lifecycle based on current proxy states."""
+    total = len(_proxies)
+    failed_ids = sorted([pid for pid, rec in _proxies.items() if rec.get("status") == "down"])
+    failed_count = len(failed_ids)
+    failure_rate = (failed_count / total) if total else 0.0
+    now = _utc_now_iso()
+
+    active_alert = next((a for a in reversed(_alerts) if a.get("status") == "active"), None)
+    breach = total > 0 and failure_rate >= _ALERT_THRESHOLD
+
+    if breach:
+        if active_alert is None:
+            _alerts.append(
+                {
+                    "alert_id": _new_alert_id(),
+                    "status": "active",
+                    "failure_rate": failure_rate,
+                    "total_proxies": total,
+                    "failed_proxies": failed_count,
+                    "failed_proxy_ids": failed_ids,
+                    "threshold": _ALERT_THRESHOLD,
+                    "fired_at": now,
+                    "resolved_at": None,
+                    "message": "Proxy pool failure rate exceeded threshold",
+                }
+            )
+            return
+
+        active_alert["failure_rate"] = failure_rate
+        active_alert["failed_proxies"] = failed_count
+        active_alert["failed_proxy_ids"] = failed_ids
+        active_alert["message"] = "Proxy pool failure rate exceeded threshold"
+        return
+
+    if active_alert is not None:
+        active_alert["status"] = "resolved"
+        active_alert["resolved_at"] = now
 
 
 async def _probe_proxy(client: httpx.AsyncClient, url: str, timeout_s: float) -> bool:
@@ -83,6 +129,9 @@ async def _heartbeat_loop() -> None:
                         rec["consecutive_failures"] = int(rec.get("consecutive_failures") or 0) + 1
                         rec["status"] = "down"
                     rec["last_checked_at"] = at
+
+            with _state_lock:
+                _sync_alerts_locked()
 
             wake = _heartbeat_wake
             if wake is None:
@@ -211,7 +260,16 @@ class ProxiesListResponse(BaseModel):
 
 
 class AlertsListResponse(BaseModel):
-    alerts: list[dict[str, Any]]
+    alert_id: str
+    status: Literal["active", "resolved"]
+    failure_rate: float
+    total_proxies: int
+    failed_proxies: int
+    failed_proxy_ids: list[str]
+    threshold: float
+    fired_at: str
+    resolved_at: str | None
+    message: str
 
 
 # --- Helpers ---
@@ -342,11 +400,11 @@ def delete_proxies() -> Response:
     return Response(status_code=status.HTTP_204_NO_CONTENT)
 
 
-@app.get("/alerts", response_model=AlertsListResponse)
-def get_alerts() -> AlertsListResponse:
+@app.get("/alerts", response_model=list[AlertsListResponse])
+def get_alerts() -> list[AlertsListResponse]:
     with _state_lock:
         # Alert history survives proxy pool purge.
-        return AlertsListResponse(alerts=[dict(a) for a in _alerts])
+        return [AlertsListResponse(**dict(a)) for a in _alerts]
 
 
 if __name__ == "__main__":

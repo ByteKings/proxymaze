@@ -41,7 +41,7 @@ Interactive docs (Render): [https://proxymaze-gvpj.onrender.com/docs#/](https://
 | `POST` | `/proxies` | Load proxies into the pool. **201 Created**. `replace: true` clears current pool first; omitted/false appends. Unknown extra fields are ignored. |
 | `GET` | `/proxies` | List all proxies plus aggregates: `total`, `up`, `down`, `failure_rate`. |
 | `DELETE` | `/proxies` | Clear the current proxy pool. **204 No Content**. |
-| `GET` | `/alerts` | Return alert history (currently an in-memory list). |
+| `GET` | `/alerts` | Return all alerts (active + resolved) as a JSON array. |
 
 ### Chapter 04: POST /proxies (Building the Pool)
 
@@ -98,6 +98,47 @@ Values reflect the latest **background heartbeat** result; `GET /proxies` does n
 - After purge, `GET /proxies` returns an empty pool.
 - Alert history is preserved.
 - `GET /alerts` remains accessible after purge.
+
+### Chapter 09: GET /alerts (The Alert Archive)
+
+Returns all alerts, both active and resolved, with **200 OK** as a JSON array:
+
+```json
+[
+  {
+    "alert_id": "alert-a1b2c3",
+    "status": "active",
+    "failure_rate": 0.3,
+    "total_proxies": 10,
+    "failed_proxies": 3,
+    "failed_proxy_ids": ["px-103", "px-104", "px-105"],
+    "threshold": 0.2,
+    "fired_at": "2026-04-24T10:20:00Z",
+    "resolved_at": null,
+    "message": "Proxy pool failure rate exceeded threshold"
+  }
+]
+```
+
+Required alert fields:
+
+- `alert_id`: non-empty and stable for the lifetime of that alert.
+- `status`: `active` while breach holds; `resolved` after recovery.
+- `failure_rate`: failure rate that justified/maintains the alert (`>= 0.2` while active).
+- `total_proxies`: pool size at fire time.
+- `failed_proxies`: count currently down.
+- `failed_proxy_ids`: IDs currently down.
+- `threshold`: fixed at `0.2`.
+- `fired_at`: ISO 8601 UTC timestamp when breach began.
+- `resolved_at`: ISO 8601 UTC timestamp on recovery, otherwise `null`.
+- `message`: short human-readable summary.
+
+Lifecycle rules:
+
+- At most one alert is **active** at any time.
+- While breach persists, the same active `alert_id` remains active (no duplicate active alerts).
+- Once resolved, that alert remains in history unchanged except resolution fields.
+- A later fresh breach creates a **new** `alert_id`.
 
 ### Proxy URLs
 
