@@ -82,6 +82,12 @@ async def _heartbeat_loop() -> None:
                         rec["consecutive_failures"] = int(rec.get("consecutive_failures") or 0) + 1
                         rec["status"] = "down"
                     rec["last_checked_at"] = at
+                    rec["total_checks"] = int(rec.get("total_checks") or 0) + 1
+                    history = rec.get("history")
+                    if history is None:
+                        history = []
+                        rec["history"] = history
+                    history.append({"checked_at": at, "status": rec["status"]})
 
             wake = _heartbeat_wake
             if wake is None:
@@ -196,6 +202,22 @@ class ProxyRecord(BaseModel):
     consecutive_failures: int = 0
 
 
+class ProxyHistoryEntry(BaseModel):
+    checked_at: str
+    status: Literal["up", "down"]
+
+
+class ProxyDetailResponse(BaseModel):
+    id: str
+    url: str
+    status: Literal["pending", "up", "down"]
+    last_checked_at: str | None = None
+    consecutive_failures: int = 0
+    total_checks: int
+    uptime_percentage: float
+    history: list[ProxyHistoryEntry]
+
+
 class ProxiesUpsertResponse(BaseModel):
     accepted: int
     proxies: list[ProxyRecord]
@@ -235,6 +257,29 @@ def _merge_config(data: dict[str, int], update: ConfigUpdate) -> dict[str, int]:
     if update.request_timeout_ms is not None:
         out["request_timeout_ms"] = update.request_timeout_ms
     return out
+
+
+def _calculate_uptime_percentage(history: list[dict[str, Any]], total_checks: int) -> float:
+    if total_checks <= 0:
+        return 0.0
+    up_count = sum(1 for item in history if item.get("status") == "up")
+    return round((up_count / total_checks) * 100.0, 1)
+
+
+def _proxy_detail_from_record(record: dict[str, Any]) -> ProxyDetailResponse:
+    history = record.get("history") or []
+    raw_total = record.get("total_checks")
+    total_checks = int(raw_total) if raw_total is not None else len(history)
+    return ProxyDetailResponse(
+        id=record["id"],
+        url=record["url"],
+        status=record.get("status", "pending"),
+        last_checked_at=record.get("last_checked_at"),
+        consecutive_failures=int(record.get("consecutive_failures") or 0),
+        total_checks=total_checks,
+        uptime_percentage=_calculate_uptime_percentage(history, total_checks),
+        history=[ProxyHistoryEntry(**entry) for entry in history],
+    )
 
 
 # --- Routes ---
@@ -295,6 +340,8 @@ def post_proxies(body: ProxiesUpsert) -> ProxiesUpsertResponse:
                 "status": "pending",
                 "last_checked_at": None,
                 "consecutive_failures": 0,
+                "total_checks": 0,
+                "history": [],
             }
             accepted += 1
             accepted_ids.append(pid)
@@ -326,6 +373,25 @@ def get_proxies() -> ProxiesListResponse:
             failure_rate=failure_rate,
             proxies=items,
         )
+
+
+@app.get("/proxies/{proxy_id}", response_model=ProxyDetailResponse)
+def get_proxy(proxy_id: str) -> ProxyDetailResponse:
+    with _state_lock:
+        record = _proxies.get(proxy_id)
+        if record is None:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Proxy not found")
+        return _proxy_detail_from_record(record)
+
+
+@app.get("/proxies/{proxy_id}/history", response_model=list[ProxyHistoryEntry])
+def get_proxy_history(proxy_id: str) -> list[ProxyHistoryEntry]:
+    with _state_lock:
+        record = _proxies.get(proxy_id)
+        if record is None:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Proxy not found")
+        history = record.get("history") or []
+        return [ProxyHistoryEntry(**entry) for entry in history]
 
 
 if __name__ == "__main__":
