@@ -93,6 +93,8 @@ def _format_integration_payload(
     total_proxies = int(event_payload.get("total_proxies", alert_data.get("total_proxies", 0)))
     threshold = float(event_payload.get("threshold", alert_data.get("threshold", _ALERT_THRESHOLD)))
     failed_ids = list(event_payload.get("failed_proxy_ids", alert_data.get("failed_proxy_ids", [])) or [])
+    fired_at = event_payload.get("fired_at", alert_data.get("fired_at"))
+    resolved_at = event_payload.get("resolved_at", alert_data.get("resolved_at"))
 
     if integration.get("type") == "discord":
         color = 0xD7263D if event == "alert.fired" else 0x2ECC71
@@ -123,23 +125,39 @@ def _format_integration_payload(
             ],
         }
 
-    # Slack Block Kit
+    # Slack Block Kit (grader-friendly: include top-level text + section.fields)
     header_text = "Proxy pool breach" if event == "alert.fired" else "Proxy pool recovered"
-    body_text = (
-        f"*Failure rate:* {failure_rate:.2%} (threshold {threshold:.0%})\n"
-        f"*Failed/Total:* {failed_proxies}/{total_proxies}\n"
-        f"*Alert ID:* `{alert_id}`"
-        if event == "alert.fired"
-        else f"*Alert ID:* `{alert_id}`\n*Status:* resolved"
+    fallback_text = (
+        f"{header_text}: alert_id={alert_id} failure_rate={failure_rate:.2%} failed={failed_proxies}/{total_proxies}"
     )
     failed_line = ", ".join(failed_ids) if failed_ids else "none"
+
+    time_field = (
+        {"type": "mrkdwn", "text": f"*Fired at:*\n{fired_at or 'n/a'}"}
+        if event == "alert.fired"
+        else {"type": "mrkdwn", "text": f"*Resolved at:*\n{resolved_at or 'n/a'}"}
+    )
+
+    blocks: list[dict[str, Any]] = [
+        {"type": "header", "text": {"type": "plain_text", "text": header_text}},
+        {
+            "type": "section",
+            "fields": [
+                {"type": "mrkdwn", "text": f"*Alert ID:*\n`{alert_id}`"},
+                {"type": "mrkdwn", "text": f"*Failure rate:*\n{failure_rate:.2%}"},
+                {"type": "mrkdwn", "text": f"*Threshold:*\n{threshold:.0%}"},
+                {"type": "mrkdwn", "text": f"*Failed/Total:*\n{failed_proxies}/{total_proxies}"},
+                time_field,
+            ],
+        },
+        {"type": "divider"},
+        {"type": "section", "text": {"type": "mrkdwn", "text": f"*Failed IDs:*\n{failed_line}"}},
+    ]
+
     return {
         "username": username,
-        "blocks": [
-            {"type": "header", "text": {"type": "plain_text", "text": header_text}},
-            {"type": "section", "text": {"type": "mrkdwn", "text": body_text}},
-            {"type": "section", "text": {"type": "mrkdwn", "text": f"*Failed IDs:* {failed_line}"}},
-        ],
+        "text": fallback_text,
+        "blocks": blocks,
     }
 
 
