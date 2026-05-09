@@ -36,7 +36,7 @@ Interactive docs: [http://localhost:8000/docs](http://localhost:8000/docs) (Swag
 |--------|------|-------------|
 | `GET` | `/health` | Liveness check (`{"status":"ok"}`). |
 | `GET` | `/config` | Current settings: `check_interval_seconds`, `request_timeout_ms`. |
-| `POST` | `/config` | Partial update; omit fields you do not want to change. Values must be ≥ 1 when set. |
+| `POST` | `/config` | Heartbeat settings: **`check_interval_seconds`** (pause between full passes) and **`request_timeout_ms`** (per-probe HTTP timeout). Partial update OK. **200 OK** returns the merged config and new values apply **immediately** (current sleep is interrupted so the next pass runs under the new rules). Defaults: `15` / `3000`. Example: `{"check_interval_seconds":15,"request_timeout_ms":3000}`. |
 | `POST` | `/proxies` | Register proxy URLs. Optional `replace: true` clears existing entries first. |
 | `GET` | `/proxies` | List all proxies plus aggregates: `total`, `up`, `down`, `failure_rate`. |
 
@@ -57,4 +57,4 @@ curl -s http://localhost:8000/proxies
 ## Limitations
 
 - No persistence: restarting the process clears config overrides and the proxy list.
-- Registered proxies start as `pending`; there is no background health checker wired up in this minimal version—the config keys are placeholders for a future checker.
+- The heartbeat probes each proxy URL with **HEAD**, then **GET** if HEAD fails or returns 405. Status is `up` if the response is successful (typical 2xx/3xx); connection errors and most failures mark `down`.
