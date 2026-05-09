@@ -42,6 +42,9 @@ Interactive docs (Render): [https://proxymaze-gvpj.onrender.com/docs#/](https://
 | `GET` | `/proxies` | List all proxies plus aggregates: `total`, `up`, `down`, `failure_rate`. |
 | `DELETE` | `/proxies` | Clear the current proxy pool. **204 No Content**. |
 | `GET` | `/alerts` | Return all alerts (active + resolved) as a JSON array. |
+| `POST` | `/webhooks` | Register raw JSON alert event receiver. **201 Created**. |
+| `POST` | `/integrations` | Register Slack/Discord formatted alert integration. **201 Created**. |
+| `GET` | `/metrics` | Return operational monitoring metrics. **200 OK**. |
 
 ### Chapter 04: POST /proxies (Building the Pool)
 
@@ -139,6 +142,129 @@ Lifecycle rules:
 - While breach persists, the same active `alert_id` remains active (no duplicate active alerts).
 - Once resolved, that alert remains in history unchanged except resolution fields.
 - A later fresh breach creates a **new** `alert_id`.
+
+### Chapter 10: POST /webhooks (The Messenger)
+
+Registers a URL to receive raw alert lifecycle webhooks.
+
+Request:
+
+```json
+{
+  "url": "https://receiver.example/proxywatch-webhook"
+}
+```
+
+Response (**201 Created**):
+
+```json
+{
+  "webhook_id": "wh-123",
+  "url": "https://receiver.example/proxywatch-webhook"
+}
+```
+
+Raw lifecycle payloads:
+
+- `alert.fired`:
+
+```json
+{
+  "event": "alert.fired",
+  "alert_id": "alert-a1b2c3",
+  "fired_at": "2026-04-24T10:20:00Z",
+  "failure_rate": 0.3,
+  "total_proxies": 10,
+  "failed_proxies": 3,
+  "failed_proxy_ids": ["px-103", "px-104", "px-105"],
+  "threshold": 0.2,
+  "message": "Proxy pool failure rate exceeded threshold"
+}
+```
+
+- `alert.resolved`:
+
+```json
+{
+  "event": "alert.resolved",
+  "alert_id": "alert-a1b2c3",
+  "resolved_at": "2026-04-24T10:30:00Z"
+}
+```
+
+Delivery behavior:
+
+- `Content-Type: application/json` is used.
+- Each state transition is delivered to each registered receiver.
+- Transient errors (`500`, `502`, `503`, `504`) and network errors are retried until success.
+- Duplicate successful deliveries are prevented per transition/receiver pair.
+
+### Chapter 11: POST /integrations (The Integration Layer)
+
+Registers Slack or Discord formatted alert integrations.
+
+Slack request:
+
+```json
+{
+  "type": "slack",
+  "webhook_url": "https://receiver.example/slack",
+  "username": "ProxyWatch",
+  "events": ["alert.fired", "alert.resolved"]
+}
+```
+
+Discord request:
+
+```json
+{
+  "type": "discord",
+  "webhook_url": "https://receiver.example/discord",
+  "username": "ProxyWatch",
+  "events": ["alert.fired", "alert.resolved"]
+}
+```
+
+Response (**201 Created**):
+
+```json
+{
+  "integration_id": "int-1",
+  "type": "slack",
+  "webhook_url": "https://receiver.example/slack",
+  "username": "ProxyWatch",
+  "events": ["alert.fired", "alert.resolved"]
+}
+```
+
+Notes:
+
+- Additional request fields are accepted and ignored.
+- `events` controls which lifecycle events the integration receives.
+- Slack payloads are sent as `{ \"username\": \"...\", \"text\": \"...\" }`.
+- Discord payloads are sent as `{ \"username\": \"...\", \"content\": \"...\" }`.
+
+### Chapter 12: GET /metrics (The Control Room)
+
+Returns operational monitoring counters with **200 OK**:
+
+```json
+{
+  "total_checks": 120,
+  "current_pool_size": 10,
+  "active_alerts": 1,
+  "total_alerts": 3,
+  "webhook_deliveries": 4
+}
+```
+
+Field meaning:
+
+- `total_checks`: cumulative number of proxy checks completed by the background heartbeat.
+- `current_pool_size`: number of proxies currently loaded in the pool.
+- `active_alerts`: current count of active alerts (expected to be `0` or `1` with lifecycle rules).
+- `total_alerts`: total alert objects recorded in history (active + resolved).
+- `webhook_deliveries`: cumulative successful outbound deliveries (webhooks + integrations).
 
 ### Proxy URLs
 
