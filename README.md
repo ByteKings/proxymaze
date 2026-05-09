@@ -38,8 +38,33 @@ Interactive docs (Render): [https://proxymaze-gvpj.onrender.com/docs#/](https://
 | `GET` | `/health` | Liveness check (`{"status":"ok"}`). |
 | `GET` | `/config` | Current settings: `check_interval_seconds`, `request_timeout_ms`. |
 | `POST` | `/config` | Heartbeat settings: **`check_interval_seconds`** (pause between full passes) and **`request_timeout_ms`** (per-probe HTTP timeout). Partial update OK. **200 OK** returns the merged config and new values apply **immediately** (current sleep is interrupted so the next pass runs under the new rules). Defaults: `15` / `3000`. Example: `{"check_interval_seconds":15,"request_timeout_ms":3000}`. |
-| `POST` | `/proxies` | Register proxy URLs. Optional `replace: true` clears existing entries first. |
+| `POST` | `/proxies` | Load proxies into the pool. **201 Created**. `replace: true` clears current pool first; omitted/false appends. Unknown extra fields are ignored. |
 | `GET` | `/proxies` | List all proxies plus aggregates: `total`, `up`, `down`, `failure_rate`. |
+| `DELETE` | `/proxies` | Clear the current proxy pool. **204 No Content**. |
+| `GET` | `/alerts` | Return alert history (currently an in-memory list). |
+
+### Chapter 04: POST /proxies (Building the Pool)
+
+Request example:
+
+```json
+{
+  "proxies": [
+    "https://proxy-provider.example/proxy/px-101",
+    "https://proxy-provider.example/proxy/px-102"
+  ],
+  "replace": true
+}
+```
+
+Rules:
+
+- `replace` omitted or `false`: append to current pool.
+- `replace: true`: clear pool first, then load provided proxies.
+- New proxies start as `pending` and transition to `up`/`down` via background probes.
+- Unknown request fields are ignored cleanly.
+
+Response is **201 Created** with accepted count and accepted proxies from that request.
 
 ### Chapter 05: GET /proxies (The Watchtower)
 
@@ -65,6 +90,14 @@ Returns a live pool summary and per-proxy state with **200 OK**:
 
 Each proxy includes at minimum `id`, `url`, `status`, `last_checked_at`, and `consecutive_failures`.
 Values reflect the latest **background heartbeat** result; `GET /proxies` does not trigger a fresh probe.
+
+### Chapter 08: DELETE /proxies (The Graveyard)
+
+`DELETE /proxies` clears the active pool and returns **204 No Content**.
+
+- After purge, `GET /proxies` returns an empty pool.
+- Alert history is preserved.
+- `GET /alerts` remains accessible after purge.
 
 ### Proxy URLs
 
