@@ -12,7 +12,7 @@ from urllib.parse import urlparse
 
 import httpx
 import uvicorn
-from fastapi import FastAPI, HTTPException, status
+from fastapi import FastAPI, HTTPException, Response, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.openapi.utils import get_openapi
 from pydantic import BaseModel, ConfigDict, Field, field_validator
@@ -30,6 +30,7 @@ _config: dict[str, int] = {
 }
 
 _proxies: dict[str, dict[str, Any]] = {}
+_alerts: list[dict[str, Any]] = []
 
 
 def _request_heartbeat_wake() -> None:
@@ -209,6 +210,10 @@ class ProxiesListResponse(BaseModel):
     proxies: list[ProxyRecord]
 
 
+class AlertsListResponse(BaseModel):
+    alerts: list[dict[str, Any]]
+
+
 # --- Helpers ---
 
 
@@ -326,6 +331,22 @@ def get_proxies() -> ProxiesListResponse:
             failure_rate=failure_rate,
             proxies=items,
         )
+
+
+@app.delete("/proxies", status_code=status.HTTP_204_NO_CONTENT)
+def delete_proxies() -> Response:
+    global _proxies
+    with _state_lock:
+        _proxies = {}
+    _request_heartbeat_wake()
+    return Response(status_code=status.HTTP_204_NO_CONTENT)
+
+
+@app.get("/alerts", response_model=AlertsListResponse)
+def get_alerts() -> AlertsListResponse:
+    with _state_lock:
+        # Alert history survives proxy pool purge.
+        return AlertsListResponse(alerts=[dict(a) for a in _alerts])
 
 
 if __name__ == "__main__":
