@@ -15,7 +15,7 @@ import uvicorn
 from fastapi import FastAPI, HTTPException, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.openapi.utils import get_openapi
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 from uvicorn.middleware.proxy_headers import ProxyHeadersMiddleware
 
 _state_lock = threading.Lock()
@@ -174,6 +174,8 @@ class ConfigResponse(BaseModel):
 
 
 class ProxiesUpsert(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
     proxies: list[str] = Field(default_factory=list)
     replace: bool = False
 
@@ -264,7 +266,11 @@ def get_config() -> ConfigResponse:
         return ConfigResponse(**_config)
 
 
-@app.post("/proxies", response_model=ProxiesUpsertResponse)
+@app.post(
+    "/proxies",
+    response_model=ProxiesUpsertResponse,
+    status_code=status.HTTP_201_CREATED,
+)
 def post_proxies(body: ProxiesUpsert) -> ProxiesUpsertResponse:
     global _proxies
     with _state_lock:
@@ -272,6 +278,7 @@ def post_proxies(body: ProxiesUpsert) -> ProxiesUpsertResponse:
             _proxies = {}
 
         accepted = 0
+        accepted_ids: list[str] = []
         errors: list[str] = []
 
         for raw in body.proxies:
@@ -290,6 +297,7 @@ def post_proxies(body: ProxiesUpsert) -> ProxiesUpsertResponse:
                 "consecutive_failures": 0,
             }
             accepted += 1
+            accepted_ids.append(pid)
 
         if errors and accepted == 0 and body.proxies:
             raise HTTPException(
@@ -297,7 +305,7 @@ def post_proxies(body: ProxiesUpsert) -> ProxiesUpsertResponse:
                 detail={"message": "No valid proxies in request", "errors": errors},
             )
 
-        records = [ProxyRecord(**_proxies[k]) for k in sorted(_proxies.keys())]
+        records = [ProxyRecord(**_proxies[k]) for k in sorted(accepted_ids)]
         result = ProxiesUpsertResponse(accepted=accepted, proxies=records)
     _request_heartbeat_wake()
     return result
