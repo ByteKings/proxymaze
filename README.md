@@ -28,7 +28,8 @@ python main.py
 
 `python main.py` reads the port from the `PORT` environment variable (default `8000`), which matches platforms like Render that inject `PORT`.
 
-Interactive docs: [http://localhost:8000/docs](http://localhost:8000/docs) (Swagger UI).
+Interactive docs (local): [http://localhost:8000/docs](http://localhost:8000/docs) (Swagger UI).
+Interactive docs (Render): [https://proxymaze-gvpj.onrender.com/docs#/](https://proxymaze-gvpj.onrender.com/docs#/).
 
 ## API overview
 
