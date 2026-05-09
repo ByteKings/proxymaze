@@ -8,9 +8,40 @@ from urllib.parse import urlparse
 
 import uvicorn
 from fastapi import FastAPI, HTTPException, status
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.openapi.utils import get_openapi
 from pydantic import BaseModel, Field, field_validator
+from uvicorn.middleware.proxy_headers import ProxyHeadersMiddleware
 
 app = FastAPI(title="ProxyMaze")
+
+# Trust X-Forwarded-* from Render so OpenAPI / logs see https and the public host.
+app.add_middleware(ProxyHeadersMiddleware, trusted_hosts="*")
+# Browser clients (Swagger "Try it out", local SPAs) may not be same-origin in some tools.
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+
+def custom_openapi() -> dict[str, Any]:
+    if app.openapi_schema:
+        return app.openapi_schema
+    openapi_schema = get_openapi(
+        title=app.title,
+        version=app.version,
+        openapi_version=app.openapi_version,
+        routes=app.routes,
+    )
+    # Relative base so Swagger UI builds https://<host>/... instead of a bad/missing URL.
+    openapi_schema["servers"] = [{"url": "/", "description": "This deployment"}]
+    app.openapi_schema = openapi_schema
+    return app.openapi_schema
+
+
+app.openapi = custom_openapi  # type: ignore[method-assign]
 
 # --- In-memory state ---
 
