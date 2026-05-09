@@ -121,9 +121,12 @@ def _sync_alerts_locked() -> list[dict[str, Any]]:
             )
             return events
 
+        # Keep the active alert consistent with current pool state.
         active_alert["failure_rate"] = failure_rate
+        active_alert["total_proxies"] = total
         active_alert["failed_proxies"] = failed_count
         active_alert["failed_proxy_ids"] = failed_ids
+        active_alert["threshold"] = _ALERT_THRESHOLD
         active_alert["message"] = "Proxy pool failure rate exceeded threshold"
         return events
 
@@ -170,7 +173,8 @@ async def _delivery_worker() -> None:
     queue = _delivery_queue
     if queue is None:
         return
-    async with httpx.AsyncClient() as client:
+    timeout = httpx.Timeout(8.0)
+    async with httpx.AsyncClient(timeout=timeout, follow_redirects=False) as client:
         while True:
             item = await queue.get()
             recipient_id = item["recipient_id"]
@@ -182,7 +186,28 @@ async def _delivery_worker() -> None:
             try:
                 while True:
                     try:
-                        resp = await client.post(url, json=payload)
+                        # Preserve POST across redirects (some capture servers front with redirects).
+                        target = url
+                        redirects = 0
+                        while True:
+                            resp = await client.post(
+                                target,
+                                json=payload,
+                                headers={"Content-Type": "application/json"},
+                            )
+                            if (
+                                resp.status_code in (301, 302, 303, 307, 308)
+                                and "location" in resp.headers
+                                and redirects < 5
+                            ):
+                                loc = resp.headers["location"]
+                                if loc.startswith("/"):
+                                    p = httpx.URL(target)
+                                    loc = str(p.copy_with(path=loc, query=None, fragment=None))
+                                target = loc
+                                redirects += 1
+                                continue
+                            break
                         if 200 <= resp.status_code < 300:
                             with _state_lock:
                                 _delivery_enqueued.discard(marker)
@@ -195,6 +220,8 @@ async def _delivery_worker() -> None:
                             continue
                         with _state_lock:
                             _delivery_enqueued.discard(marker)
+                            # Do not keep re-enqueuing forever on permanent 4xx responses.
+                            _delivery_succeeded.add(marker)
                         break
                     except httpx.RequestError:
                         await asyncio.sleep(backoff_s)
@@ -206,10 +233,8 @@ async def _delivery_worker() -> None:
 async def _probe_proxy(client: httpx.AsyncClient, url: str, timeout_s: float) -> bool:
     timeout = httpx.Timeout(timeout_s)
     try:
-        r = await client.head(url, timeout=timeout, follow_redirects=True)
-        if r.status_code == 405:
-            r = await client.get(url, timeout=timeout, follow_redirects=True)
-        # Contract rule: only 2xx counts as up.
+        # Use GET so timeout and 5xx are always classified as down.
+        r = await client.get(url, timeout=timeout, follow_redirects=True)
         return 200 <= r.status_code < 300
     except httpx.RequestError:
         # Timeout / connection failures / refusal are down by definition.

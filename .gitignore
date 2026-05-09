@@ -6,3 +6,6 @@ venv/
 .env
 .env.*
 !.env.example
+
+# Local scratch / copies
+maincopy (1).py
