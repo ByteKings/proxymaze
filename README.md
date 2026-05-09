@@ -94,6 +94,29 @@ Returns a live pool summary and per-proxy state with **200 OK**:
 Each proxy includes at minimum `id`, `url`, `status`, `last_checked_at`, and `consecutive_failures`.
 Values reflect the latest **background heartbeat** result; `GET /proxies` does not trigger a fresh probe.
 
+### Chapter 06: GET /proxies/{id} (The Dossier)
+
+Returns details for one proxy with **200 OK**; unknown IDs return **404 Not Found**.
+
+Response includes the five baseline fields from `GET /proxies` plus:
+
+- `total_checks`
+- `uptime_percentage`
+- `history` (array of `{ checked_at, status }`)
+
+### Chapter 07: GET /proxies/{id}/history (The Chronicle)
+
+Returns check history for one proxy as a JSON array with **200 OK**; unknown IDs return **404 Not Found**.
+
+Example:
+
+```json
+[
+  { "checked_at": "2026-04-24T10:15:30Z", "status": "up" },
+  { "checked_at": "2026-04-24T10:16:00Z", "status": "down" }
+]
+```
+
 ### Chapter 08: DELETE /proxies (The Graveyard)
 
 `DELETE /proxies` clears the active pool and returns **204 No Content**.
@@ -241,8 +264,29 @@ Notes:
 
 - Additional request fields are accepted and ignored.
 - `events` controls which lifecycle events the integration receives.
-- Slack payloads are sent as `{ \"username\": \"...\", \"text\": \"...\" }`.
-- Discord payloads are sent as `{ \"username\": \"...\", \"content\": \"...\" }`.
+- Slack payloads include `text` and `attachments` (color, fields, footer, integer `ts`).
+- Discord payloads include `embeds` with title, description, integer color, fields, and `footer.text`.
+
+### Bonus Integration 01: Slack (+10)
+
+On `alert.fired` and `alert.resolved`, Slack integrations receive JSON with:
+
+- `username` (non-empty)
+- `text` (non-empty summary)
+- `attachments[0].color` in `#RRGGBB` form
+- `attachments[0].fields` including titles containing: Alert ID, Failure Rate, Failed Proxies, Threshold, Failed IDs, Fired At
+- `attachments[0].footer` (non-empty)
+- `attachments[0].ts` (integer Unix seconds)
+
+### Bonus Integration 02: Discord (+10)
+
+On every alert event, Discord integrations receive JSON with:
+
+- `embeds[0].title` (non-empty)
+- `embeds[0].description` (non-empty summary)
+- `embeds[0].color` (integer `0..16777215`)
+- `embeds[0].fields` names including: Alert ID, Failure Rate, Failed Proxies, Threshold, Failed IDs
+- `embeds[0].footer.text` (non-empty)
 
 ### Chapter 12: GET /metrics (The Control Room)
 
@@ -283,4 +327,4 @@ curl -s http://localhost:8000/proxies
 ## Limitations
 
 - No persistence: restarting the process clears config overrides and the proxy list.
-- The heartbeat probes each proxy URL with **HEAD**, then **GET** if HEAD fails or returns 405. Status is `up` if the response is successful (typical 2xx/3xx); connection errors and most failures mark `down`.
+- The heartbeat probes each proxy URL with **HEAD**, then **GET** if HEAD returns `405`. A proxy is marked `up` only on **2xx**. Timeouts, connection failures/refusals, and any **5xx** are marked `down`.

@@ -68,12 +68,34 @@ def _event_key_from_payload(payload: dict[str, Any]) -> str:
     return f"alert.resolved:{payload['alert_id']}"
 
 
+def _iso_to_unix_seconds(value: str) -> int:
+    return int(datetime.fromisoformat(value.replace("Z", "+00:00")).timestamp())
+
+
+def _get_alert_by_id_locked(alert_id: str) -> dict[str, Any] | None:
+    for alert in reversed(_alerts):
+        if alert.get("alert_id") == alert_id:
+            return alert
+    return None
+
+
 def _format_integration_payload(
     integration: dict[str, Any], event_payload: dict[str, Any]
 ) -> dict[str, Any]:
     event = event_payload["event"]
     alert_id = event_payload["alert_id"]
     username = integration.get("username") or "ProxyWatch"
+    alert_data = _get_alert_by_id_locked(alert_id) or {}
+
+    failure_rate = event_payload.get("failure_rate", alert_data.get("failure_rate"))
+    failed_proxies = event_payload.get("failed_proxies", alert_data.get("failed_proxies"))
+    total_proxies = event_payload.get("total_proxies", alert_data.get("total_proxies"))
+    threshold = event_payload.get("threshold", alert_data.get("threshold", _ALERT_THRESHOLD))
+    failed_ids = event_payload.get("failed_proxy_ids", alert_data.get("failed_proxy_ids", []))
+    fired_at = event_payload.get("fired_at", alert_data.get("fired_at"))
+    ts_source = event_payload.get("resolved_at") or fired_at or _utc_now_iso()
+    ts = _iso_to_unix_seconds(ts_source)
+
     if event == "alert.fired":
         text = (
             f"[{event}] id={alert_id} failure_rate={event_payload['failure_rate']:.3f} "
@@ -84,8 +106,75 @@ def _format_integration_payload(
         text = f"[{event}] id={alert_id} resolved_at={event_payload['resolved_at']}"
 
     if integration["type"] == "discord":
-        return {"username": username, "content": text}
-    return {"username": username, "text": text}
+        color = 13632027 if event == "alert.fired" else 3066993
+        embed_fields = [
+            {"name": "Alert ID", "value": str(alert_id)},
+            {"name": "Failure Rate", "value": str(failure_rate if failure_rate is not None else "n/a")},
+            {
+                "name": "Failed Proxies",
+                "value": str(
+                    failed_proxies if failed_proxies is not None else "n/a"
+                )
+                + (
+                    f"/{total_proxies}"
+                    if total_proxies is not None and failed_proxies is not None
+                    else ""
+                ),
+            },
+            {"name": "Threshold", "value": str(threshold)},
+            {
+                "name": "Failed IDs",
+                "value": ", ".join(failed_ids) if failed_ids else "none",
+            },
+        ]
+        return {
+            "username": username,
+            "embeds": [
+                {
+                    "title": f"ProxyMaze {event}",
+                    "description": text,
+                    "color": color,
+                    "fields": embed_fields,
+                    "footer": {"text": "ProxyMaze Alerts"},
+                }
+            ],
+        }
+
+    # Slack payload with attachments for richer operational context.
+    fields = [
+        {"title": "Alert ID", "value": str(alert_id)},
+        {"title": "Failure Rate", "value": str(failure_rate if failure_rate is not None else "n/a")},
+        {
+            "title": "Failed Proxies",
+            "value": str(
+                failed_proxies if failed_proxies is not None else "n/a"
+            )
+            + (
+                f"/{total_proxies}"
+                if total_proxies is not None and failed_proxies is not None
+                else ""
+            ),
+        },
+        {"title": "Threshold", "value": str(threshold)},
+        {
+            "title": "Failed IDs",
+            "value": ", ".join(failed_ids) if failed_ids else "none",
+        },
+        {"title": "Fired At", "value": str(fired_at or "n/a")},
+    ]
+    color = "#D62728" if event == "alert.fired" else "#2CA02C"
+    return {
+        "username": username,
+        "text": text,
+        "attachments": [
+            {
+                "color": color,
+                "fields": fields,
+                "footer": "ProxyMaze Alerts",
+                "ts": ts,
+            }
+        ],
+    }
 
 
 def _sync_alerts_locked() -> list[dict[str, Any]]:
@@ -238,13 +327,11 @@ async def _probe_proxy(client: httpx.AsyncClient, url: str, timeout_s: float) ->
         r = await client.head(url, timeout=timeout, follow_redirects=True)
         if r.status_code == 405:
             r = await client.get(url, timeout=timeout, follow_redirects=True)
-        return bool(r.is_success or (200 <= r.status_code < 400))
+        # Contract rule: only 2xx counts as up.
+        return 200 <= r.status_code < 300
     except httpx.RequestError:
-        try:
-            r = await client.get(url, timeout=timeout, follow_redirects=True)
-            return bool(r.is_success or (200 <= r.status_code < 400))
-        except httpx.RequestError:
-            return False
+        # Timeout / connection failures / refusal are down by definition.
+        return False
 
 
 async def _heartbeat_loop() -> None:
