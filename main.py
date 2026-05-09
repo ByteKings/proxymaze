@@ -34,8 +34,6 @@ _proxies: dict[str, dict[str, Any]] = {}
 _alerts: list[dict[str, Any]] = []
 _webhooks: dict[str, str] = {}
 _next_webhook_id = 1
-_integrations: dict[str, dict[str, Any]] = {}
-_next_integration_id = 1
 _ALERT_THRESHOLD = 0.2
 _delivery_queue: asyncio.Queue[dict[str, Any]] | None = None
 _delivery_task: asyncio.Task[None] | None = None
@@ -77,104 +75,6 @@ def _get_alert_by_id_locked(alert_id: str) -> dict[str, Any] | None:
         if alert.get("alert_id") == alert_id:
             return alert
     return None
-
-
-def _format_integration_payload(
-    integration: dict[str, Any], event_payload: dict[str, Any]
-) -> dict[str, Any]:
-    event = event_payload["event"]
-    alert_id = event_payload["alert_id"]
-    username = integration.get("username") or "ProxyWatch"
-    alert_data = _get_alert_by_id_locked(alert_id) or {}
-
-    failure_rate = event_payload.get("failure_rate", alert_data.get("failure_rate"))
-    failed_proxies = event_payload.get("failed_proxies", alert_data.get("failed_proxies"))
-    total_proxies = event_payload.get("total_proxies", alert_data.get("total_proxies"))
-    threshold = event_payload.get("threshold", alert_data.get("threshold", _ALERT_THRESHOLD))
-    failed_ids = event_payload.get("failed_proxy_ids", alert_data.get("failed_proxy_ids", []))
-    fired_at = event_payload.get("fired_at", alert_data.get("fired_at"))
-    ts_source = event_payload.get("resolved_at") or fired_at or _utc_now_iso()
-    ts = _iso_to_unix_seconds(ts_source)
-
-    if event == "alert.fired":
-        text = (
-            f"[{event}] id={alert_id} failure_rate={event_payload['failure_rate']:.3f} "
-            f"failed={event_payload['failed_proxies']}/{event_payload['total_proxies']} "
-            f"threshold={event_payload['threshold']}"
-        )
-    else:
-        text = f"[{event}] id={alert_id} resolved_at={event_payload['resolved_at']}"
-
-    if integration["type"] == "discord":
-        color = 13632027 if event == "alert.fired" else 3066993
-        embed_fields = [
-            {"name": "Alert ID", "value": str(alert_id)},
-            {"name": "Failure Rate", "value": str(failure_rate if failure_rate is not None else "n/a")},
-            {
-                "name": "Failed Proxies",
-                "value": str(
-                    failed_proxies if failed_proxies is not None else "n/a"
-                )
-                + (
-                    f"/{total_proxies}"
-                    if total_proxies is not None and failed_proxies is not None
-                    else ""
-                ),
-            },
-            {"name": "Threshold", "value": str(threshold)},
-            {
-                "name": "Failed IDs",
-                "value": ", ".join(failed_ids) if failed_ids else "none",
-            },
-        ]
-        return {
-            "username": username,
-            "embeds": [
-                {
-                    "title": f"ProxyMaze {event}",
-                    "description": text,
-                    "color": color,
-                    "fields": embed_fields,
-                    "footer": {"text": "ProxyMaze Alerts"},
-                }
-            ],
-        }
-
-    # Slack payload with attachments for richer operational context.
-    fields = [
-        {"title": "Alert ID", "value": str(alert_id)},
-        {"title": "Failure Rate", "value": str(failure_rate if failure_rate is not None else "n/a")},
-        {
-            "title": "Failed Proxies",
-            "value": str(
-                failed_proxies if failed_proxies is not None else "n/a"
-            )
-            + (
-                f"/{total_proxies}"
-                if total_proxies is not None and failed_proxies is not None
-                else ""
-            ),
-        },
-        {"title": "Threshold", "value": str(threshold)},
-        {
-            "title": "Failed IDs",
-            "value": ", ".join(failed_ids) if failed_ids else "none",
-        },
-        {"title": "Fired At", "value": str(fired_at or "n/a")},
-    ]
-    color = "#D62728" if event == "alert.fired" else "#2CA02C"
-    return {
-        "username": username,
-        "text": text,
-        "attachments": [
-            {
-                "color": color,
-                "fields": fields,
-                "footer": "ProxyMaze Alerts",
-                "ts": ts,
-            }
-        ],
-    }
 
 
 def _sync_alerts_locked() -> list[dict[str, Any]]:
@@ -247,7 +147,6 @@ async def _enqueue_event_deliveries(event_payload: dict[str, Any]) -> None:
     event_key = _event_key_from_payload(event_payload)
     with _state_lock:
         webhooks = list(_webhooks.items())
-        integrations = list(_integrations.items())
         to_enqueue: list[dict[str, Any]] = []
         for webhook_id, url in webhooks:
             recipient_id = f"webhook:{webhook_id}"
@@ -261,23 +160,6 @@ async def _enqueue_event_deliveries(event_payload: dict[str, Any]) -> None:
                     "url": url,
                     "event_key": event_key,
                     "payload": dict(event_payload),
-                }
-            )
-
-        for integration_id, integration in integrations:
-            if event_payload["event"] not in integration["events"]:
-                continue
-            recipient_id = f"integration:{integration_id}"
-            marker = (event_key, recipient_id)
-            if marker in _delivery_succeeded or marker in _delivery_enqueued:
-                continue
-            _delivery_enqueued.add(marker)
-            to_enqueue.append(
-                {
-                    "recipient_id": recipient_id,
-                    "url": integration["webhook_url"],
-                    "event_key": event_key,
-                    "payload": _format_integration_payload(integration, event_payload),
                 }
             )
     for item in to_enqueue:
@@ -545,49 +427,6 @@ class WebhookCreateResponse(BaseModel):
     url: str
 
 
-class IntegrationCreateRequest(BaseModel):
-    model_config = ConfigDict(extra="ignore")
-
-    type: Literal["slack", "discord"]
-    webhook_url: str
-    username: str = "ProxyWatch"
-    events: list[Literal["alert.fired", "alert.resolved"]] = Field(
-        default_factory=lambda: ["alert.fired", "alert.resolved"]
-    )
-
-    @field_validator("webhook_url")
-    @classmethod
-    def webhook_url_must_be_http(cls, v: str) -> str:
-        value = v.strip()
-        parsed = urlparse(value)
-        if parsed.scheme not in ("http", "https") or not parsed.netloc:
-            raise ValueError("webhook_url must be an absolute http(s) URL")
-        return value
-
-    @field_validator("username")
-    @classmethod
-    def username_non_empty(cls, v: str) -> str:
-        value = v.strip()
-        if not value:
-            raise ValueError("username must be non-empty")
-        return value
-
-    @field_validator("events")
-    @classmethod
-    def events_non_empty(cls, v: list[Literal["alert.fired", "alert.resolved"]]) -> list[Literal["alert.fired", "alert.resolved"]]:
-        if not v:
-            raise ValueError("events must include at least one event")
-        return v
-
-
-class IntegrationCreateResponse(BaseModel):
-    integration_id: str
-    type: Literal["slack", "discord"]
-    webhook_url: str
-    username: str
-    events: list[Literal["alert.fired", "alert.resolved"]]
-
-
 class MetricsResponse(BaseModel):
     total_checks: int
     current_pool_size: int
@@ -798,31 +637,6 @@ def post_webhooks(body: WebhookCreateRequest) -> WebhookCreateResponse:
         _next_webhook_id += 1
         _webhooks[webhook_id] = body.url
         return WebhookCreateResponse(webhook_id=webhook_id, url=body.url)
-
-
-@app.post(
-    "/integrations",
-    response_model=IntegrationCreateResponse,
-    status_code=status.HTTP_201_CREATED,
-)
-def post_integrations(body: IntegrationCreateRequest) -> IntegrationCreateResponse:
-    global _next_integration_id
-    with _state_lock:
-        integration_id = f"int-{_next_integration_id}"
-        _next_integration_id += 1
-        _integrations[integration_id] = {
-            "type": body.type,
-            "webhook_url": body.webhook_url,
-            "username": body.username,
-            "events": list(body.events),
-        }
-        return IntegrationCreateResponse(
-            integration_id=integration_id,
-            type=body.type,
-            webhook_url=body.webhook_url,
-            username=body.username,
-            events=list(body.events),
-        )
 
 
 @app.get("/metrics", response_model=MetricsResponse)
