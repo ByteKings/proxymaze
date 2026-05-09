@@ -34,6 +34,8 @@ _proxies: dict[str, dict[str, Any]] = {}
 _alerts: list[dict[str, Any]] = []
 _webhooks: dict[str, str] = {}
 _next_webhook_id = 1
+_integrations: dict[str, dict[str, Any]] = {}
+_next_integration_id = 1
 _ALERT_THRESHOLD = 0.2
 _delivery_queue: asyncio.Queue[dict[str, Any]] | None = None
 _delivery_task: asyncio.Task[None] | None = None
@@ -75,6 +77,70 @@ def _get_alert_by_id_locked(alert_id: str) -> dict[str, Any] | None:
         if alert.get("alert_id") == alert_id:
             return alert
     return None
+
+
+def _format_integration_payload(
+    integration: dict[str, Any], event_payload: dict[str, Any]
+) -> dict[str, Any]:
+    """Return Slack Block Kit or Discord Embeds payload for an alert event."""
+    event = event_payload["event"]
+    alert_id = event_payload["alert_id"]
+    username = integration.get("username") or "ProxyMaze"
+
+    alert_data = _get_alert_by_id_locked(alert_id) or {}
+    failure_rate = float(event_payload.get("failure_rate", alert_data.get("failure_rate", 0.0)))
+    failed_proxies = int(event_payload.get("failed_proxies", alert_data.get("failed_proxies", 0)))
+    total_proxies = int(event_payload.get("total_proxies", alert_data.get("total_proxies", 0)))
+    threshold = float(event_payload.get("threshold", alert_data.get("threshold", _ALERT_THRESHOLD)))
+    failed_ids = list(event_payload.get("failed_proxy_ids", alert_data.get("failed_proxy_ids", [])) or [])
+
+    if integration.get("type") == "discord":
+        color = 0xD7263D if event == "alert.fired" else 0x2ECC71
+        title = "Proxy pool breach" if event == "alert.fired" else "Proxy pool recovered"
+        desc = (
+            f"Failure rate is {failure_rate:.2%} (threshold {threshold:.0%})."
+            if event == "alert.fired"
+            else f"Alert `{alert_id}` resolved."
+        )
+        return {
+            "username": username,
+            "embeds": [
+                {
+                    "title": title,
+                    "description": desc,
+                    "color": color,
+                    "fields": [
+                        {"name": "Alert ID", "value": str(alert_id), "inline": True},
+                        {"name": "Failure rate", "value": f"{failure_rate:.2%}", "inline": True},
+                        {"name": "Failed/Total", "value": f"{failed_proxies}/{total_proxies}", "inline": True},
+                        {
+                            "name": "Failed IDs",
+                            "value": (", ".join(failed_ids) if failed_ids else "none"),
+                            "inline": False,
+                        },
+                    ],
+                }
+            ],
+        }
+
+    # Slack Block Kit
+    header_text = "Proxy pool breach" if event == "alert.fired" else "Proxy pool recovered"
+    body_text = (
+        f"*Failure rate:* {failure_rate:.2%} (threshold {threshold:.0%})\n"
+        f"*Failed/Total:* {failed_proxies}/{total_proxies}\n"
+        f"*Alert ID:* `{alert_id}`"
+        if event == "alert.fired"
+        else f"*Alert ID:* `{alert_id}`\n*Status:* resolved"
+    )
+    failed_line = ", ".join(failed_ids) if failed_ids else "none"
+    return {
+        "username": username,
+        "blocks": [
+            {"type": "header", "text": {"type": "plain_text", "text": header_text}},
+            {"type": "section", "text": {"type": "mrkdwn", "text": body_text}},
+            {"type": "section", "text": {"type": "mrkdwn", "text": f"*Failed IDs:* {failed_line}"}},
+        ],
+    }
 
 
 def _sync_alerts_locked() -> list[dict[str, Any]]:
@@ -150,6 +216,7 @@ async def _enqueue_event_deliveries(event_payload: dict[str, Any]) -> None:
     event_key = _event_key_from_payload(event_payload)
     with _state_lock:
         webhooks = list(_webhooks.items())
+        integrations = list(_integrations.items())
         to_enqueue: list[dict[str, Any]] = []
         for webhook_id, url in webhooks:
             recipient_id = f"webhook:{webhook_id}"
@@ -163,6 +230,23 @@ async def _enqueue_event_deliveries(event_payload: dict[str, Any]) -> None:
                     "url": url,
                     "event_key": event_key,
                     "payload": dict(event_payload),
+                }
+            )
+
+        for integration_id, integration in integrations:
+            if event_payload["event"] not in integration.get("events", ["alert.fired", "alert.resolved"]):
+                continue
+            recipient_id = f"integration:{integration_id}"
+            marker = (event_key, recipient_id)
+            if marker in _delivery_succeeded or marker in _delivery_enqueued:
+                continue
+            _delivery_enqueued.add(marker)
+            to_enqueue.append(
+                {
+                    "recipient_id": recipient_id,
+                    "url": integration["webhook_url"],
+                    "event_key": event_key,
+                    "payload": _format_integration_payload(integration, dict(event_payload)),
                 }
             )
     for item in to_enqueue:
@@ -242,7 +326,8 @@ async def _probe_proxy(client: httpx.AsyncClient, url: str, timeout_s: float) ->
 
 
 async def _heartbeat_loop() -> None:
-    async with httpx.AsyncClient() as client:
+    limits = httpx.Limits(max_connections=200, max_keepalive_connections=50)
+    async with httpx.AsyncClient(limits=limits) as client:
         while True:
             with _state_lock:
                 cfg = _config.copy()
@@ -251,26 +336,32 @@ async def _heartbeat_loop() -> None:
             interval = cfg["check_interval_seconds"]
             timeout_s = cfg["request_timeout_ms"] / 1000.0
 
-            for pid, url in targets:
-                ok = await _probe_proxy(client, url, timeout_s)
+            if targets:
+                # Probe in parallel so a round isn't N * timeout.
+                results = await asyncio.gather(
+                    *[_probe_proxy(client, url, timeout_s) for _, url in targets],
+                    return_exceptions=True,
+                )
                 at = _utc_now_iso()
                 with _state_lock:
-                    if pid not in _proxies:
-                        continue
-                    _metrics["total_checks"] += 1
-                    rec = _proxies[pid]
-                    if ok:
-                        rec["status"] = "up"
-                        rec["consecutive_failures"] = 0
-                    else:
-                        rec["consecutive_failures"] = int(rec.get("consecutive_failures") or 0) + 1
-                        rec["status"] = "down"
-                    rec["last_checked_at"] = at
-                    rec["total_checks"] = int(rec.get("total_checks") or 0) + 1
-                    if ok:
-                        rec["total_successes"] = int(rec.get("total_successes") or 0) + 1
-                    history = rec.setdefault("history", [])
-                    history.append({"checked_at": at, "status": rec["status"]})
+                    for (pid, _), ok in zip(targets, results):
+                        if pid not in _proxies:
+                            continue
+                        is_up = bool(ok) if not isinstance(ok, Exception) else False
+                        _metrics["total_checks"] += 1
+                        rec = _proxies[pid]
+                        if is_up:
+                            rec["status"] = "up"
+                            rec["consecutive_failures"] = 0
+                        else:
+                            rec["consecutive_failures"] = int(rec.get("consecutive_failures") or 0) + 1
+                            rec["status"] = "down"
+                        rec["last_checked_at"] = at
+                        rec["total_checks"] = int(rec.get("total_checks") or 0) + 1
+                        if is_up:
+                            rec["total_successes"] = int(rec.get("total_successes") or 0) + 1
+                        history = rec.setdefault("history", [])
+                        history.append({"checked_at": at, "status": rec["status"]})
 
             with _state_lock:
                 events = _sync_alerts_locked()
@@ -450,6 +541,51 @@ class WebhookCreateRequest(BaseModel):
 class WebhookCreateResponse(BaseModel):
     webhook_id: str
     url: str
+
+
+class IntegrationCreateRequest(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
+    type: Literal["slack", "discord"]
+    webhook_url: str
+    username: str = "ProxyMaze"
+    events: list[Literal["alert.fired", "alert.resolved"]] = Field(
+        default_factory=lambda: ["alert.fired", "alert.resolved"]
+    )
+
+    @field_validator("webhook_url")
+    @classmethod
+    def webhook_url_must_be_http(cls, v: str) -> str:
+        value = v.strip()
+        parsed = urlparse(value)
+        if parsed.scheme not in ("http", "https") or not parsed.netloc:
+            raise ValueError("webhook_url must be an absolute http(s) URL")
+        return value
+
+    @field_validator("username")
+    @classmethod
+    def username_non_empty(cls, v: str) -> str:
+        value = v.strip()
+        if not value:
+            raise ValueError("username must be non-empty")
+        return value
+
+    @field_validator("events")
+    @classmethod
+    def events_non_empty(
+        cls, v: list[Literal["alert.fired", "alert.resolved"]]
+    ) -> list[Literal["alert.fired", "alert.resolved"]]:
+        if not v:
+            raise ValueError("events must include at least one event")
+        return v
+
+
+class IntegrationCreateResponse(BaseModel):
+    integration_id: str
+    type: Literal["slack", "discord"]
+    webhook_url: str
+    username: str
+    events: list[Literal["alert.fired", "alert.resolved"]]
 
 
 class MetricsResponse(BaseModel):
@@ -662,6 +798,31 @@ def post_webhooks(body: WebhookCreateRequest) -> WebhookCreateResponse:
         _next_webhook_id += 1
         _webhooks[webhook_id] = body.url
         return WebhookCreateResponse(webhook_id=webhook_id, url=body.url)
+
+
+@app.post(
+    "/integrations",
+    response_model=IntegrationCreateResponse,
+    status_code=status.HTTP_201_CREATED,
+)
+def post_integrations(body: IntegrationCreateRequest) -> IntegrationCreateResponse:
+    global _next_integration_id
+    with _state_lock:
+        integration_id = f"int-{_next_integration_id}"
+        _next_integration_id += 1
+        _integrations[integration_id] = {
+            "type": body.type,
+            "webhook_url": body.webhook_url,
+            "username": body.username,
+            "events": list(body.events),
+        }
+        return IntegrationCreateResponse(
+            integration_id=integration_id,
+            type=body.type,
+            webhook_url=body.webhook_url,
+            username=body.username,
+            events=list(body.events),
+        )
 
 
 @app.get("/metrics", response_model=MetricsResponse)
