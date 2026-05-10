@@ -40,6 +40,8 @@ Interactive docs (Render): [https://proxymaze-gvpj.onrender.com/docs#/](https://
 | `POST` | `/config` | Heartbeat settings: **`check_interval_seconds`** (pause between full passes) and **`request_timeout_ms`** (per-probe HTTP timeout). Partial update OK. **200 OK** returns the merged config and new values apply **immediately** (current sleep is interrupted so the next pass runs under the new rules). Defaults: `15` / `3000`. Example: `{"check_interval_seconds":15,"request_timeout_ms":3000}`. |
 | `POST` | `/proxies` | Load proxies into the pool. **201 Created**. `replace: true` clears current pool first; omitted/false appends. Unknown extra fields are ignored. |
 | `GET` | `/proxies` | List all proxies plus aggregates: `total`, `up`, `down`, `failure_rate`. |
+| `GET` | `/proxies/{id}` | Single-proxy dossier: baseline fields plus `total_checks`, `uptime_percentage`, `history`. **404** if unknown. |
+| `GET` | `/proxies/{id}/history` | Check history for one proxy (JSON array). **404** if unknown. |
 | `DELETE` | `/proxies` | Clear the current proxy pool. **204 No Content**. |
 | `GET` | `/alerts` | Return all alerts (active + resolved) as a JSON array. |
 | `POST` | `/webhooks` | Register raw JSON alert event receiver. **201 Created**. |
